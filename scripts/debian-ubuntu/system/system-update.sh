@@ -2,7 +2,7 @@
 
 #
 # Script Name: system-update.sh
-# Description: Comprehensive Ubuntu system update script covering APT, Snap, Flatpak, optional firmware, and cleanup
+# Description: Ubuntu system update script with APT by default, optional Snap/Flatpak/firmware updates, and configuration conflict detection
 # Author: Zachary Arthur
 # Created: 2025-08-26
 # Last Modified: 2025-08-26
@@ -11,10 +11,10 @@
 #
 # Examples:
 #   system-update.sh --help
-#   system-update.sh --verbose
+#   system-update.sh --verbose --show-output
 #   system-update.sh --dry-run
-#   system-update.sh --enable-firmware
-#   system-update.sh --skip-flatpak
+#   system-update.sh --enable-snap --enable-flatpak
+#   system-update.sh --enable-dist-upgrade --enable-firmware
 #
 # Requirements:
 #   - Bash 4.0 or higher
@@ -39,9 +39,11 @@ readonly SCRIPT_VERSION="1.0.0"
 # Default values
 VERBOSE=false
 DRY_RUN=false
+SHOW_OUTPUT=false
 ENABLE_FIRMWARE=false
-SKIP_FLATPAK=false
-SKIP_SNAP=false
+ENABLE_FLATPAK=false
+ENABLE_SNAP=false
+ENABLE_DIST_UPGRADE=false
 
 # Colors for output
 readonly RED='\033[0;31m'
@@ -55,6 +57,7 @@ readonly NC='\033[0m' # No Color
 # Update tracking
 declare -a UPDATED_PACKAGES=()
 declare -a MANUAL_ACTIONS=()
+declare -a CONFIG_CONFLICTS=()
 REBOOT_REQUIRED=false
 
 # Logging functions
@@ -101,24 +104,30 @@ usage() {
 Usage: $SCRIPT_NAME [OPTIONS]
 
 Description:
-    Comprehensive Ubuntu system update script that updates APT packages, Snap packages,
-    Flatpak applications, and performs system cleanup. Optionally updates firmware when
-    requested. Provides detailed information about manual actions that may be required.
+    Ubuntu system update script that performs APT package updates by default.
+    Optionally updates Snap packages, Flatpak applications, performs distribution
+    upgrades, and firmware updates when explicitly enabled. Detects configuration
+    conflicts and provides detailed information about manual actions required.
 
 Options:
-    -h, --help          Show this help message and exit
-    -v, --verbose       Enable verbose output
-    -d, --dry-run       Show what would be done without executing
-    --enable-firmware   Enable firmware updates (requires fwupd installation)
-    --skip-flatpak      Skip Flatpak updates (useful if Flatpak not installed)
-    --skip-snap         Skip Snap updates (useful for minimal systems)
-    --version           Show version information
+    -h, --help              Show this help message and exit
+    -v, --verbose           Enable verbose debug output
+    -d, --dry-run           Show what would be done without executing
+    --show-output           Display full command output in real-time
+    --enable-firmware       Enable firmware updates (requires fwupd installation)
+    --enable-flatpak        Enable Flatpak application updates
+    --enable-snap           Enable Snap package updates
+    --enable-dist-upgrade   Enable distribution upgrades (beyond regular upgrades)
+    --version               Show version information
 
 Examples:
-    $SCRIPT_NAME                    # Full system update (no firmware)
-    $SCRIPT_NAME --verbose          # Update with detailed output
-    $SCRIPT_NAME --dry-run          # See what would be updated
-    $SCRIPT_NAME --enable-firmware  # Include firmware updates
+    $SCRIPT_NAME                          # Basic APT update and upgrade only
+    $SCRIPT_NAME --verbose --show-output  # APT update with full output display
+    $SCRIPT_NAME --dry-run                # See what would be updated
+    $SCRIPT_NAME --enable-snap            # Include Snap package updates
+    $SCRIPT_NAME --enable-flatpak         # Include Flatpak app updates
+    $SCRIPT_NAME --enable-dist-upgrade    # Include distribution upgrades
+    $SCRIPT_NAME --enable-firmware        # Include firmware updates
 
 EOF
 }
@@ -229,10 +238,50 @@ check_sudo() {
     fi
 }
 
+# Check for configuration conflicts in apt output
+check_config_conflicts() {
+    local apt_output="$1"
+    local conflicts_found=false
+    
+    # Check for various types of configuration conflicts
+    if echo "$apt_output" | grep -q "Configuration file.*which you have modified"; then
+        conflicts_found=true
+        CONFIG_CONFLICTS+=("Modified configuration files detected during package updates")
+    fi
+    
+    if echo "$apt_output" | grep -q "dpkg: configuration conflict"; then
+        conflicts_found=true
+        CONFIG_CONFLICTS+=("dpkg configuration conflicts detected")
+    fi
+    
+    if echo "$apt_output" | grep -q "conffile.*differs from"; then
+        conflicts_found=true
+        CONFIG_CONFLICTS+=("Configuration file differences detected")
+    fi
+    
+    if echo "$apt_output" | grep -q "*** .*\.dpkg-"; then
+        conflicts_found=true
+        CONFIG_CONFLICTS+=("dpkg backup files created (*.dpkg-old, *.dpkg-new, *.dpkg-dist)")
+    fi
+    
+    # Extract specific configuration files mentioned
+    while IFS= read -r line; do
+        if [[ "$line" =~ Configuration\ file\ \'([^\']+)\' ]]; then
+            CONFIG_CONFLICTS+=("Config file needs review: ${BASH_REMATCH[1]}")
+        fi
+    done <<< "$apt_output"
+    
+    if [[ "$conflicts_found" == true ]]; then
+        MANUAL_ACTIONS+=("Review configuration conflicts - run: sudo dpkg --configure -a")
+        MANUAL_ACTIONS+=("Check for .dpkg-* files in /etc: find /etc -name '*.dpkg-*' -type f")
+    fi
+}
+
 # Execute command with proper logging
 execute_command() {
     local cmd="$1"
     local description="$2"
+    local capture_output="${3:-false}"
     
     if [[ "$DRY_RUN" == true ]]; then
         log_info "[DRY RUN] Would execute: $description"
@@ -243,9 +292,17 @@ execute_command() {
     log_info "$description"
     log_debug "Executing: $cmd"
     
-    if [[ "$VERBOSE" == true ]]; then
+    if [[ "$SHOW_OUTPUT" == true ]]; then
+        # Show full command output in real-time
         eval "$cmd"
+    elif [[ "$VERBOSE" == true ]]; then
+        # Show command output for verbose mode
+        eval "$cmd"
+    elif [[ "$capture_output" == true ]]; then
+        # Capture output for parsing (like conflict detection)
+        eval "$cmd" 2>&1
     else
+        # Silent execution
         eval "$cmd" >/dev/null 2>&1
     fi
 }
@@ -271,30 +328,60 @@ update_apt_packages() {
 upgrade_apt_packages() {
     log_section "Upgrading APT Packages"
     
-    execute_command "sudo apt upgrade -y" "Upgrading installed packages"
-    
-    # Check for dist-upgrade needs
-    local dist_upgrades
+    # Capture output to check for conflicts
+    local apt_output
     if [[ "$DRY_RUN" == false ]]; then
-        dist_upgrades=$(apt list --upgradeable 2>/dev/null | wc -l)
-        if [[ $dist_upgrades -gt 1 ]]; then
-            log_info "Additional packages available via dist-upgrade"
-            execute_command "sudo apt dist-upgrade -y" "Performing distribution upgrade"
-        fi
+        apt_output=$(execute_command "sudo apt upgrade -y" "Upgrading installed packages" true)
+        check_config_conflicts "$apt_output"
     else
-        execute_command "sudo apt dist-upgrade -y" "Would perform distribution upgrade if needed"
+        execute_command "sudo apt upgrade -y" "Upgrading installed packages"
+    fi
+}
+
+# Distribution upgrade function (now separate and optional)
+upgrade_distribution() {
+    if [[ "$ENABLE_DIST_UPGRADE" == false ]]; then
+        # Check if dist-upgrade would do anything additional
+        if [[ "$DRY_RUN" == false ]]; then
+            local dist_upgrades
+            dist_upgrades=$(apt list --upgradeable 2>/dev/null | wc -l)
+            if [[ $dist_upgrades -gt 1 ]]; then
+                log_info "Additional packages available via distribution upgrade (use --enable-dist-upgrade)"
+                MANUAL_ACTIONS+=("Consider running with --enable-dist-upgrade for additional package updates")
+            fi
+        fi
+        return 0
+    fi
+    
+    log_section "Performing Distribution Upgrade"
+    
+    # Capture output to check for conflicts
+    local apt_output
+    if [[ "$DRY_RUN" == false ]]; then
+        apt_output=$(execute_command "sudo apt dist-upgrade -y" "Performing distribution upgrade" true)
+        check_config_conflicts "$apt_output"
+    else
+        execute_command "sudo apt dist-upgrade -y" "Would perform distribution upgrade"
     fi
 }
 
 # Snap package management
 update_snap_packages() {
-    if [[ "$SKIP_SNAP" == true ]]; then
-        log_debug "Skipping Snap updates (--skip-snap specified)"
+    if [[ "$ENABLE_SNAP" == false ]]; then
+        if command_exists snap && [[ "$DRY_RUN" == false ]]; then
+            local snap_count
+            snap_count=$(snap list 2>/dev/null | tail -n +2 | wc -l)
+            if [[ $snap_count -gt 0 ]]; then
+                log_info "Snap packages available for update (use --enable-snap)"
+                MANUAL_ACTIONS+=("Consider running with --enable-snap to update $snap_count Snap packages")
+            fi
+        fi
         return 0
     fi
     
     if ! command_exists snap; then
-        log_debug "Snap not installed, skipping Snap updates"
+        log_warn "Snap not installed but --enable-snap specified"
+        MANUAL_ACTIONS+=("Install snapd to use Snap packages: sudo apt install snapd")
         return 0
     fi
     
@@ -314,13 +401,21 @@ update_snap_packages() {
 
 # Flatpak package management
 update_flatpak_packages() {
-    if [[ "$SKIP_FLATPAK" == true ]]; then
-        log_debug "Skipping Flatpak updates (--skip-flatpak specified)"
+    if [[ "$ENABLE_FLATPAK" == false ]]; then
+        if command_exists flatpak && [[ "$DRY_RUN" == false ]]; then
+            local flatpak_count
+            flatpak_count=$(flatpak list --app 2>/dev/null | wc -l)
+            if [[ $flatpak_count -gt 0 ]]; then
+                log_info "Flatpak applications available for update (use --enable-flatpak)"
+                MANUAL_ACTIONS+=("Consider running with --enable-flatpak to update $flatpak_count Flatpak apps")
+            fi
+        fi
         return 0
     fi
     
     if ! command_exists flatpak; then
-        log_debug "Flatpak not installed, skipping Flatpak updates"
+        log_warn "Flatpak not installed but --enable-flatpak specified"
+        MANUAL_ACTIONS+=("Install Flatpak to use Flatpak apps: sudo apt install flatpak")
         return 0
     fi
     
@@ -377,8 +472,8 @@ cleanup_system() {
     execute_command "sudo apt autoremove -y" "Removing orphaned packages"
     execute_command "sudo apt autoclean" "Cleaning package cache"
     
-    # Clean snap cache if snap is available
-    if command_exists snap && [[ "$SKIP_SNAP" == false ]]; then
+    # Clean snap cache if snap updates were enabled
+    if command_exists snap && [[ "$ENABLE_SNAP" == true ]]; then
         # Snap doesn't have a direct cache clean, but we can check disk usage
         if [[ "$DRY_RUN" == false ]]; then
             local snap_cache_size
@@ -387,8 +482,8 @@ cleanup_system() {
         fi
     fi
     
-    # Clean flatpak cache if flatpak is available
-    if command_exists flatpak && [[ "$SKIP_FLATPAK" == false ]]; then
+    # Clean flatpak cache if flatpak updates were enabled
+    if command_exists flatpak && [[ "$ENABLE_FLATPAK" == true ]]; then
         execute_command "flatpak uninstall --unused -y" "Removing unused Flatpak runtimes"
     fi
 }
@@ -461,25 +556,67 @@ display_summary() {
     if [[ ${#UPDATED_PACKAGES[@]} -gt 0 ]]; then
         log_info "Updates completed:"
         for update in "${UPDATED_PACKAGES[@]}"; do
-            log_info "  ✓ $update"
+            log_info "  * $update"
         done
     else
         log_info "No packages were updated (system may already be current)"
     fi
     
-    if [[ ${#MANUAL_ACTIONS[@]} -gt 0 ]]; then
-        log_section "Manual Actions Required"
-        log_warn "The following actions may require your attention:"
-        for action in "${MANUAL_ACTIONS[@]}"; do
-            log_warn "  ! $action"
+    # Display configuration conflicts (critical)
+    if [[ ${#CONFIG_CONFLICTS[@]} -gt 0 ]]; then
+        log_section "Configuration Conflicts Detected"
+        log_error "CRITICAL: Configuration conflicts need manual resolution:"
+        for conflict in "${CONFIG_CONFLICTS[@]}"; do
+            log_error "  [!] $conflict"
+        done
+    fi
+    
+    # Categorize manual actions
+    local -a critical_actions=()
+    local -a recommended_actions=()
+    local -a optional_actions=()
+    
+    for action in "${MANUAL_ACTIONS[@]}"; do
+        if [[ "$action" =~ ^.*[Rr]eboot.*$ ]] || [[ "$action" =~ ^.*[Cc]onflict.*$ ]] || [[ "$action" =~ ^.*dpkg.*$ ]]; then
+            critical_actions+=("$action")
+        elif [[ "$action" =~ ^.*[Cc]onsider.*$ ]] || [[ "$action" =~ ^.*needrestart.*$ ]]; then
+            optional_actions+=("$action")
+        else
+            recommended_actions+=("$action")
+        fi
+    done
+    
+    # Display categorized actions
+    if [[ ${#critical_actions[@]} -gt 0 ]]; then
+        log_section "Critical Actions Required"
+        log_error "These actions are essential and should be performed soon:"
+        for action in "${critical_actions[@]}"; do
+            log_error "  [!] $action"
+        done
+    fi
+    
+    if [[ ${#recommended_actions[@]} -gt 0 ]]; then
+        log_section "Recommended Actions"
+        log_warn "These actions are recommended for optimal system health:"
+        for action in "${recommended_actions[@]}"; do
+            log_warn "  * $action"
+        done
+    fi
+    
+    if [[ ${#optional_actions[@]} -gt 0 ]]; then
+        log_section "Optional Actions"
+        log_info "Consider these actions for additional functionality:"
+        for action in "${optional_actions[@]}"; do
+            log_info "  - $action"
         done
     fi
     
     if [[ "$REBOOT_REQUIRED" == true ]]; then
         echo
-        log_warn "⚠️  SYSTEM REBOOT REQUIRED ⚠️"
-        log_warn "Critical updates have been installed that require a system restart."
-        log_warn "Please reboot your system when convenient."
+        log_error "*** SYSTEM REBOOT REQUIRED ***"
+        log_error "Critical updates have been installed that require a system restart."
+        log_error "Reason: Kernel or critical system library updates"
+        log_error "Please reboot your system when convenient."
     fi
 }
 
@@ -494,6 +631,7 @@ main() {
     # Perform updates in logical order
     update_apt_packages
     upgrade_apt_packages
+    upgrade_distribution
     update_snap_packages
     update_flatpak_packages
     update_firmware
@@ -527,16 +665,24 @@ while [[ $# -gt 0 ]]; do
             DRY_RUN=true
             shift
             ;;
+        --show-output)
+            SHOW_OUTPUT=true
+            shift
+            ;;
         --enable-firmware)
             ENABLE_FIRMWARE=true
             shift
             ;;
-        --skip-flatpak)
-            SKIP_FLATPAK=true
+        --enable-flatpak)
+            ENABLE_FLATPAK=true
             shift
             ;;
-        --skip-snap)
-            SKIP_SNAP=true
+        --enable-snap)
+            ENABLE_SNAP=true
+            shift
+            ;;
+        --enable-dist-upgrade)
+            ENABLE_DIST_UPGRADE=true
             shift
             ;;
         --version)
